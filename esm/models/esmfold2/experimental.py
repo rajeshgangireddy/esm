@@ -62,6 +62,7 @@ from esm.models.esmfold2.layers import (
 # Not circular: model.py's reference to this module is inside ``from_pretrained``.
 from esm.models.esmfold2.model import _IGNORED_FEATURE_KEYS
 from esm.models.hub import HubPreTrainedModel, resolve_model_dir
+from esm.utils.device import supports_amp_autocast
 
 _EPS = 1e-5
 
@@ -988,10 +989,11 @@ class EsmFold2ExperimentalModel(HubPreTrainedModel):
 
         atom_to_token = atom_to_token * atm_mask.long()
 
-        use_amp = ref_pos.device.type == "cuda"
+        device_type = ref_pos.device.type
+        use_amp = supports_amp_autocast(device_type)
         with (
             torch.set_grad_enabled(res_type_soft is not None),
-            torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16),
+            torch.amp.autocast(device_type, enabled=use_amp, dtype=torch.bfloat16),
         ):
             # 1. Input embeddings
             x_inputs = self.inputs_embedder(
