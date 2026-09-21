@@ -40,7 +40,10 @@ try:
         triangle_multiplicative_update as _cue_tri_mul,
     )
 
-    CUE_AVAILABLE = True
+    # cuequivariance JIT-compiles via nvrtc (CUDA-only): the import above can
+    # succeed on XPU even though the library can't actually run there, so
+    # also require a real CUDA device.
+    CUE_AVAILABLE = torch.cuda.is_available()
 except ImportError:
     _cue_attn_pair_bias: Any = None
     _cue_tri_mul: Any = None
@@ -49,9 +52,10 @@ except ImportError:
 # Vendored inference-only Triton kernels.
 try:
     # `@triton.autotune` resolves `driver.active` when it decorates, so importing
-    # these without a device raises RuntimeError rather than ImportError.
-    if not torch.cuda.is_available():
-        raise ImportError("no CUDA device; skipping the Triton kernels")
+    # these without a device raises RuntimeError rather than ImportError. Triton
+    # supports XPU too, so allow either.
+    if not (torch.cuda.is_available() or torch.xpu.is_available()):
+        raise ImportError("no CUDA/XPU device; skipping the Triton kernels")
 
     from esm.models.esmfold2.kernels import (
         FusedDropoutResidual as _FusedDropoutResidual,
@@ -71,10 +75,20 @@ except (ImportError, RuntimeError):
     TRITON_KERNELS_AVAILABLE = False
 
 from esm.models.esmfold2.config import EsmFold2Config
+from esm.utils.device import (
+    get_rng_state_all,
+    manual_seed_all,
+    resolve_default_device,
+    set_rng_state_all,
+    supports_amp_autocast,
+)
 
 BACKEND_FUSED = "fused"
 BACKEND_CUEQ = "cuequivariance"
 _VALID_BACKENDS = (None, BACKEND_FUSED, BACKEND_CUEQ)
+
+# Devices the vendored Triton kernels can run on.
+_TRITON_DEVICE_TYPES = ("cuda", "xpu")
 
 # The vendored fused Triton kernels (LN+SwiGLU, trimul-with-residual) operate in
 # bfloat16 only. Single-source that dtype here so every fused-path buffer and
@@ -88,7 +102,7 @@ def _fused_active(module: nn.Module, tensor: Tensor) -> bool:
         TRITON_KERNELS_AVAILABLE
         and getattr(module, "_kernel_backend", None) == BACKEND_FUSED
         and not torch.is_grad_enabled()
-        and tensor.is_cuda
+        and tensor.device.type in _TRITON_DEVICE_TYPES
     )
 
 
@@ -97,7 +111,7 @@ def _fused_pair_stack_active(module: nn.Module, tensor: Tensor) -> bool:
     return (
         TRITON_KERNELS_AVAILABLE
         and getattr(module, "_kernel_backend", None) == BACKEND_FUSED
-        and tensor.is_cuda
+        and tensor.device.type in _TRITON_DEVICE_TYPES
     )
 
 
@@ -1402,7 +1416,12 @@ class DiffusionConditioning(nn.Module):
             z_rel = relative_position_encoding.to(dtype=torch.float32)
             z = torch.cat([z_trunk.to(dtype=torch.float32), z_rel], dim=-1)
             z = self.z_proj(self.z_input_norm(z))
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            device_type = z.device.type
+            with torch.autocast(
+                device_type=device_type,
+                dtype=torch.bfloat16,
+                enabled=supports_amp_autocast(device_type),
+            ):
                 for block in self.z_transitions:
                     z = z + block(z)
             if inference_cache is not None:
@@ -1907,7 +1926,7 @@ class DiffusionStructureHead(nn.Module):
                 diff_atom_intermediates = dm_out.get("atom_intermediates")
 
             # Reverse diffusion alignment (Kabsch)
-            with torch.autocast(device_type="cuda", enabled=False):
+            with torch.autocast(device_type=x_noisy.device.type, enabled=False):
                 x_noisy = self._weighted_rigid_align(
                     x_noisy.float(), x_denoised.float(), atom_mask, atom_mask
                 )
@@ -2184,31 +2203,32 @@ class LanguageModelShim(nn.Module):
 
 
 @contextmanager
-def _seed_context(seed: int | None, *, cuda: bool = True):
+def _seed_context(seed: int | None, *, seed_accelerator: bool = True):
     """Temporarily seed Python, NumPy, and PyTorch RNGs."""
     if seed is None:
         yield
         return
+    device_type = resolve_default_device().type
     py_state = random.getstate()
     np_state = np.random.get_state()
     torch_state = torch.get_rng_state()
-    cuda_states = (
-        torch.cuda.get_rng_state_all() if cuda and torch.cuda.is_available() else None
+    accel_states = (
+        get_rng_state_all(device_type) if seed_accelerator else None
     )
     seed = int(seed) % (2**32)
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if cuda and torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    if seed_accelerator:
+        manual_seed_all(device_type, seed)
     try:
         yield
     finally:
         random.setstate(py_state)
         np.random.set_state(np_state)
         torch.set_rng_state(torch_state)
-        if cuda_states is not None:
-            torch.cuda.set_rng_state_all(cuda_states)
+        if accel_states is not None:
+            set_rng_state_all(device_type, accel_states)
 
 
 # ===========================================================================
@@ -2706,7 +2726,7 @@ class FoldingTrunk(nn.Module):
             len(self.blocks) > 0
             and getattr(self.blocks[0], "_kernel_backend", None) == BACKEND_FUSED
         )
-        if pair.is_cuda and fused_on and orig_dtype != torch.bfloat16:
+        if pair.device.type in _TRITON_DEVICE_TYPES and fused_on and orig_dtype != torch.bfloat16:
             pair = pair.to(torch.bfloat16)
         for block in self.blocks:
             fn = partial(block, pair_attention_mask=pair_attention_mask)
