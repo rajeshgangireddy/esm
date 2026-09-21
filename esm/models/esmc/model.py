@@ -285,12 +285,12 @@ class EsmcModel(EsmcPreTrainedModel):
 
     def __init__(self, config: EsmcConfig):
         super().__init__(config)
-        # Every fused kernel is CUDA-only, so all of them hang off one condition:
-        # the device this model's parameters are being created on. Deriving them
-        # separately is what let the LayerNorm and attention gates disagree.
-        on_cuda = torch.get_default_device().type == "cuda"
+        # flash-attn and TE are both CUDA-only, so they hang off one condition:
+        # the device this model's parameters are being created on. Deriving
+        # them separately is what let the LayerNorm and attention gates disagree.
+        cuda_fused_kernels_available = torch.get_default_device().type == "cuda"
         self._use_flash_attn = (
-            on_cuda
+            cuda_fused_kernels_available
             and FLASH_ATTN_INSTALLED
             and config.attn_implementation == "flash_attention_2"
         )
@@ -300,7 +300,7 @@ class EsmcModel(EsmcPreTrainedModel):
             config.num_attention_heads,
             config.num_hidden_layers,
             use_flash_attn=self._use_flash_attn,
-            use_te=on_cuda and TE_INSTALLED,
+            use_te=cuda_fused_kernels_available and TE_INSTALLED,
         )
         self._sae_models: nn.ModuleDict = nn.ModuleDict()
         self._register_state_dict_hook(_drop_te_extra_state)
