@@ -28,6 +28,7 @@ from esm.models.esmc.kernels import (
 from esm.models.esmc.layers import EsmcRotaryEmbedding, EsmcTransformerStack
 from esm.models.esmc.sae import EsmcSaeLayer
 from esm.models.hub import HubPreTrainedModel, resolve_model_dir
+from esm.utils.device import resolve_default_device
 
 _SAFETENSORS_INDEX = "model.safetensors.index.json"
 _SAFETENSORS_SINGLE = "model.safetensors"
@@ -253,7 +254,7 @@ class EsmcPreTrainedModel(HubPreTrainedModel):
         if attn_implementation is not None:
             config.attn_implementation = attn_implementation
         if device is None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+            device = resolve_default_device()
         # Sets the default device the encoder reads to choose its kernels.
         with torch.device(device):
             return cls._load_pretrained(local_dir, config, device=device, dtype=dtype)
