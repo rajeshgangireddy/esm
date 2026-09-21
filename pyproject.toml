@@ -76,6 +76,7 @@ addopts = """
 """
 markers = [
   "gpu: requires a CUDA device; run in the monorepo's gpu-ci",
+  "xpu: requires an Intel XPU device; run manually on xpu hardware",
   "manual: too heavy for a hosted runner; run in the monorepo's research-ci",
   "merge_only: needs a real published checkpoint; run in the monorepo's research-ci",
 ]

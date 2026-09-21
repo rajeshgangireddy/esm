@@ -2,7 +2,7 @@
 
 Structural tests run on CPU against tiny randomly-initialised models. Tests that
 need published weights use ESMC-300M and skip when the Hub is unreachable. GPU
-tests are marked ``gpu``.
+tests are marked ``gpu``, XPU tests ``xpu``.
 """
 
 import functools
@@ -1328,6 +1328,27 @@ def test_cpu_and_gpu_agree(esmc_300m_dir, esmc_tokenizer):
         torch.testing.assert_close(actual, expected, atol=3e-3, rtol=1e-4)
 
 
+@pytest.mark.xpu
+def test_cpu_and_xpu_agree(esmc_300m_dir, esmc_tokenizer):
+    """Same weights, same input, both devices, fp32 on each side.
+
+    XPU has no fused Transformer Engine layers, so both sides run the same
+    reference implementation; the gap is just device/kernel rounding.
+    """
+    on_cpu = EsmcModel.from_pretrained(esmc_300m_dir, device="cpu")
+    on_xpu = EsmcModel.from_pretrained(esmc_300m_dir, device="xpu")
+
+    for sequence in SEQUENCES.values():
+        enc = esmc_tokenizer(sequence, return_tensors="pt")
+        with torch.no_grad():
+            expected = on_cpu(**enc).last_hidden_state.float()
+            actual = on_xpu(**{k: v.to("xpu") for k, v in enc.items()})
+            actual = actual.last_hidden_state.float().cpu()
+
+        # Observed max|Δ|: 3e-7 short to 7.4e-6 long.
+        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
 # Every build reachable on a GPU: dtype x attention backend x fused/reference
 # layers. flash_attention_2 is only paired with fp16 / bf16 because the kernel
 # rejects fp32, and only with the fused layers because a CPU-built model never
@@ -1402,6 +1423,66 @@ def test_every_gpu_build_reaches_the_reference(
             out.last_hidden_state.float()[0].norm(dim=-1).cpu(),
             torch.tensor(case["last_hidden_state_norms"]),
             atol=REFERENCE_NORM_TOLERANCE[dtype],
+            rtol=0,
+            msg=lambda text: f"{name}: {text}",
+        )
+
+
+# XPU has no flash-attn / Transformer Engine, so every build degenerates to
+# the reference layers regardless of the requested `layers`; sdpa and eager
+# are the only attention backends.
+XPU_BUILDS = [
+    (torch.float32, "sdpa"),
+    (torch.float32, "eager"),
+    (torch.bfloat16, "sdpa"),
+    (torch.bfloat16, "eager"),
+    (torch.float16, "sdpa"),
+    (torch.float16, "eager"),
+]
+
+# Worst observed across every build and length in XPU_BUILDS:
+#              max|Δ| norms   argmax mismatches (of 12 / 131 / 412)
+#   fp32       2.6e-6         0 / 0 / 0
+#   bf16       1.34e-2        0 / 2 / 1
+#   fp16       1.45e-3        0 / 1 / 0
+# Tighter than the CUDA table above: there is no Transformer Engine to
+# accommodate, so every XPU build runs the same math as the CPU reference.
+REFERENCE_NORM_TOLERANCE_XPU = {
+    torch.float32: 1e-5,
+    torch.bfloat16: 0.02,
+    torch.float16: 3e-3,
+}
+REFERENCE_ARGMAX_MISMATCHES_XPU = {torch.float32: 0, torch.bfloat16: 3, torch.float16: 2}
+
+
+@pytest.mark.xpu
+@pytest.mark.parametrize("dtype,attn", XPU_BUILDS)
+def test_every_xpu_build_reaches_the_reference(
+    esmc_300m_dir, esmc_tokenizer, dtype, attn
+):
+    """Correct, not merely self-consistent: every XPU build vs the CPU reference."""
+    model = build_esmc(
+        esmc_300m_dir,
+        device="xpu",
+        dtype=dtype,
+        attn=attn,
+        model_class=EsmcForMaskedLM,
+    )
+
+    for name, sequence in SEQUENCES.items():
+        case = reference_values()["cases"][name]
+        enc = {
+            k: v.to("xpu")
+            for k, v in esmc_tokenizer(sequence, return_tensors="pt").items()
+        }
+        with torch.no_grad():
+            out = model(**enc)
+        mismatches = argmax_mismatches(out.logits, case["argmax"])
+        assert mismatches <= REFERENCE_ARGMAX_MISMATCHES_XPU[dtype], (name, mismatches)
+        torch.testing.assert_close(
+            out.last_hidden_state.float()[0].norm(dim=-1).cpu(),
+            torch.tensor(case["last_hidden_state_norms"]),
+            atol=REFERENCE_NORM_TOLERANCE_XPU[dtype],
             rtol=0,
             msg=lambda text: f"{name}: {text}",
         )

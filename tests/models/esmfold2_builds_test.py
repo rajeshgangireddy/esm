@@ -436,7 +436,7 @@ def test_cuda_autocast_is_a_no_op_off_cuda(tiny_esmfold2):
 
 
 def test_use_amp_is_off_for_cpu_inputs(tiny_esmfold2):
-    """``use_amp = ref_pos.device.type == "cuda"``, observed rather than read.
+    """``use_amp = supports_amp_autocast(device_type)``, observed rather than read.
 
     The single device-conditional switch in ``forward``. Asserted where it takes
     effect - inside the autocast block, at the first module the block wraps -
@@ -615,9 +615,19 @@ def test_cpu_and_gpu_agree(kernel_esmfold2_config, cpu_fp32_result):
     assert_close_to_reference(result, cpu_fp32_result, GPU_TOLERANCE, "cpu-vs-gpu")
 
 
+@pytest.mark.xpu
+def test_cpu_and_xpu_agree(kernel_esmfold2_config, cpu_fp32_result):
+    """E1 on Intel XPU. Same reasoning as ``test_cpu_and_gpu_agree``."""
+    model = build_model(kernel_esmfold2_config, device="xpu")
+    assert next(model.parameters()).device.type == "xpu"
+    result = run_forward(model, ESMFOLD2_SEQUENCES[MATRIX_LENGTH], flash=False)
+
+    assert_close_to_reference(result, cpu_fp32_result, GPU_TOLERANCE, "cpu-vs-xpu")
+
+
 @pytest.mark.gpu
 def test_use_amp_is_on_for_cuda_inputs(tiny_esmfold2_config):
-    """The other half of ``use_amp = ref_pos.device.type == "cuda"``.
+    """The other half of ``use_amp = supports_amp_autocast(device_type)``.
 
     Pinned as an expectation because it is *why* the CPU/GPU tolerances below
     are bf16-sized rather than fp32-sized: there is no supported way to run the
@@ -627,6 +637,22 @@ def test_use_amp_is_on_for_cuda_inputs(tiny_esmfold2_config):
     seen: list[bool] = []
     handle = model.inputs_embedder.register_forward_pre_hook(
         lambda module, args: seen.append(torch.is_autocast_enabled("cuda"))
+    )
+    try:
+        run_forward(model, ESMFOLD2_SEQUENCES["tiny"], flash=False)
+    finally:
+        handle.remove()
+
+    assert seen and all(seen)
+
+
+@pytest.mark.xpu
+def test_use_amp_is_on_for_xpu_inputs(tiny_esmfold2_config):
+    """The XPU half of ``use_amp = supports_amp_autocast(device_type)``."""
+    model = build_model(tiny_esmfold2_config, device="xpu")
+    seen: list[bool] = []
+    handle = model.inputs_embedder.register_forward_pre_hook(
+        lambda module, args: seen.append(torch.is_autocast_enabled("xpu"))
     )
     try:
         run_forward(model, ESMFOLD2_SEQUENCES["tiny"], flash=False)
@@ -675,6 +701,36 @@ def test_every_gpu_build_reaches_the_cpu_reference(
     assert_close_to_reference(result, cpu_fp32_result, GPU_TOLERANCE, label)
 
 
+# XPU has no flash-attn and no cuequivariance build, so the matrix is just
+# backend x chunk size. Measured deltas were the same order as GPU_BUILDS
+# (9.4e-3 to 9.6e-3 vs 9.96e-3 to 1.01e-2), so it reuses GPU_TOLERANCE.
+XPU_BUILDS = [
+    (None, None),
+    (None, 64),
+    ("fused", None),
+    ("fused", 64),
+]
+
+
+@pytest.mark.xpu
+@pytest.mark.parametrize("backend,chunk_size", XPU_BUILDS)
+def test_every_xpu_build_reaches_the_cpu_reference(
+    kernel_esmfold2_config, cpu_fp32_result, backend, chunk_size
+):
+    """E2 on Intel XPU. Same reasoning as the CUDA version above."""
+    skip_if_backend_missing(backend)
+    model = build_model(kernel_esmfold2_config, device="xpu")
+    model.set_kernel_backend(backend)
+    model.set_chunk_size(chunk_size)
+
+    assert_backend_dispatched(model, backend)
+    assert_chunking_dispatched(model, chunk_size)
+
+    result = run_forward(model, ESMFOLD2_SEQUENCES[MATRIX_LENGTH], flash=False)
+    label = f"{backend}/chunk={chunk_size}"
+    assert_close_to_reference(result, cpu_fp32_result, GPU_TOLERANCE, label)
+
+
 # ---------------------------------------------------------------------------
 # Torch.compile
 # ---------------------------------------------------------------------------
@@ -699,3 +755,4 @@ def test_torch_compile_refuses_to_stack_with_the_fused_backend(tiny_esmfold2_con
     # to be enough to get past the guard.
     model.set_kernel_backend(None)
     model.apply_torch_compile(mode="fixed_seqlen")
+
