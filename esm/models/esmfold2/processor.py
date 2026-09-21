@@ -16,6 +16,12 @@ from esm.models.esmfold2.types import (
     ProteinInput,
     StructurePredictionInput,
 )
+from esm.utils.device import (
+    get_rng_state_all,
+    manual_seed_all,
+    resolve_default_device,
+    set_rng_state_all,
+)
 from esm.utils.structure.molecular_complex import MolecularComplexResult
 
 
@@ -24,23 +30,23 @@ def _seed_context(seed: int | None):
     if seed is None:
         yield
         return
+    device_type = resolve_default_device().type
     py_state = random.getstate()
     np_state = np.random.get_state()
     torch_state = torch.random.get_rng_state()
-    cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    accel_state = get_rng_state_all(device_type)
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    manual_seed_all(device_type, seed)
     try:
         yield
     finally:
         random.setstate(py_state)
         np.random.set_state(np_state)
         torch.random.set_rng_state(torch_state)
-        if cuda_state is not None:
-            torch.cuda.set_rng_state_all(cuda_state)
+        if accel_state is not None:
+            set_rng_state_all(device_type, accel_state)
 
 
 @contextmanager
