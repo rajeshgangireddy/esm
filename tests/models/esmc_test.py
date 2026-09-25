@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 from safetensors.torch import save_file
 
+from esm.layers.rotary import apply_rotary_emb_torch
 from esm.models.esmc import (
     ESMC,
     EsmcConfig,
@@ -30,6 +31,7 @@ from esm.models.esmc import (
     EsmcOutput,
     EsmcTokenizer,
 )
+from esm.models.esmc import layers as layers_module
 from esm.models.esmc import model as model_module
 from esm.models.esmc.checkpoint_layout import native_to_published, published_to_native
 from esm.models.esmc.kernels import FLASH_ATTN_INSTALLED, TE_INSTALLED
@@ -1332,8 +1334,8 @@ def test_cpu_and_gpu_agree(esmc_300m_dir, esmc_tokenizer):
 def test_cpu_and_xpu_agree(esmc_300m_dir, esmc_tokenizer):
     """Same weights, same input, both devices, fp32 on each side.
 
-    XPU has no fused Transformer Engine layers, so both sides run the same
-    reference implementation; the gap is just device/kernel rounding.
+    XPU uses its Triton RoPE kernel for inference; the CPU side is the
+    reference implementation.
     """
     on_cpu = EsmcModel.from_pretrained(esmc_300m_dir, device="cpu")
     on_xpu = EsmcModel.from_pretrained(esmc_300m_dir, device="xpu")
@@ -1345,8 +1347,70 @@ def test_cpu_and_xpu_agree(esmc_300m_dir, esmc_tokenizer):
             actual = on_xpu(**{k: v.to("xpu") for k, v in enc.items()})
             actual = actual.last_hidden_state.float().cpu()
 
-        # Observed max|Δ|: 3e-7 short to 7.4e-6 long.
+        # The original tight reference tolerance also holds with fused XPU RoPE.
         torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.xpu
+def test_xpu_rotary_triton_matches_torch_reference(monkeypatch):
+    rotary = EsmcRotaryEmbedding(dim=16).to("xpu").eval()
+    q_storage = torch.randn((2, 13, 3, 32), device="xpu", dtype=torch.float32)
+    q = q_storage[..., ::2]
+    k = torch.randn_like(q)
+
+    get_kernel = layers_module._get_xpu_rotary_kernel
+    kernel_lookups = 0
+
+    def counted_get_kernel():
+        nonlocal kernel_lookups
+        kernel_lookups += 1
+        return get_kernel()
+
+    monkeypatch.setattr(layers_module, "_get_xpu_rotary_kernel", counted_get_kernel)
+    with torch.inference_mode():
+        actual_q, actual_k = rotary(q, k)
+        assert rotary._cos_cached is not None and rotary._sin_cached is not None
+        expected_q = apply_rotary_emb_torch(q, rotary._cos_cached, rotary._sin_cached)
+        expected_k = apply_rotary_emb_torch(k, rotary._cos_cached, rotary._sin_cached)
+
+    assert kernel_lookups == 1
+    torch.testing.assert_close(actual_q, expected_q, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(actual_k, expected_k, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.xpu
+@pytest.mark.parametrize(
+    ("dtype", "requires_grad"), [(torch.float32, True), (torch.bfloat16, False)]
+)
+def test_xpu_rotary_keeps_reference_for_grad_or_non_fp32(
+    monkeypatch, dtype, requires_grad
+):
+    def unexpected_kernel():
+        raise AssertionError("unsupported RoPE configuration selected Triton")
+
+    monkeypatch.setattr(layers_module, "_get_xpu_rotary_kernel", unexpected_kernel)
+    rotary = EsmcRotaryEmbedding(dim=16).to(device="xpu", dtype=dtype).eval()
+    q = torch.randn(
+        (2, 13, 3, 16), device="xpu", dtype=dtype, requires_grad=requires_grad
+    )
+    k = torch.randn_like(q, requires_grad=requires_grad)
+
+    if requires_grad:
+        actual_q, actual_k = rotary(q, k)
+        (actual_q.sum() + actual_k.sum()).backward()
+        assert q.grad is not None and k.grad is not None
+    else:
+        with torch.inference_mode():
+            actual_q, actual_k = rotary(q, k)
+            assert rotary._cos_cached is not None and rotary._sin_cached is not None
+            expected_q = apply_rotary_emb_torch(
+                q, rotary._cos_cached, rotary._sin_cached
+            )
+            expected_k = apply_rotary_emb_torch(
+                k, rotary._cos_cached, rotary._sin_cached
+            )
+        assert torch.equal(actual_q, expected_q)
+        assert torch.equal(actual_k, expected_k)
 
 
 # Every build reachable on a GPU: dtype x attention backend x fused/reference
@@ -1440,19 +1504,23 @@ XPU_BUILDS = [
     (torch.float16, "eager"),
 ]
 
-# Worst observed across every build and length in XPU_BUILDS:
+# Pre-fusion maxima across every build and length in XPU_BUILDS:
 #              max|Δ| norms   argmax mismatches (of 12 / 131 / 412)
 #   fp32       2.6e-6         0 / 0 / 0
 #   bf16       1.34e-2        0 / 2 / 1
 #   fp16       1.45e-3        0 / 1 / 0
-# Tighter than the CUDA table above: there is no Transformer Engine to
-# accommodate, so every XPU build runs the same math as the CPU reference.
+# XPU has no Transformer Engine; fp32 inference now uses fused Triton RoPE.
+# These bounds are against fixed CPU references and still pass for that path.
 REFERENCE_NORM_TOLERANCE_XPU = {
     torch.float32: 1e-5,
     torch.bfloat16: 0.02,
     torch.float16: 3e-3,
 }
-REFERENCE_ARGMAX_MISMATCHES_XPU = {torch.float32: 0, torch.bfloat16: 3, torch.float16: 2}
+REFERENCE_ARGMAX_MISMATCHES_XPU = {
+    torch.float32: 0,
+    torch.bfloat16: 3,
+    torch.float16: 2,
+}
 
 
 @pytest.mark.xpu
@@ -1462,11 +1530,7 @@ def test_every_xpu_build_reaches_the_reference(
 ):
     """Correct, not merely self-consistent: every XPU build vs the CPU reference."""
     model = build_esmc(
-        esmc_300m_dir,
-        device="xpu",
-        dtype=dtype,
-        attn=attn,
-        model_class=EsmcForMaskedLM,
+        esmc_300m_dir, device="xpu", dtype=dtype, attn=attn, model_class=EsmcForMaskedLM
     )
 
     for name, sequence in SEQUENCES.items():
