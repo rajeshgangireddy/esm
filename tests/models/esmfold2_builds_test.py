@@ -332,6 +332,23 @@ def test_cuequivariance_tri_mul_rejects_non_cuda_device(monkeypatch):
         tri_mul(pair)
 
 
+@pytest.mark.xpu
+@pytest.mark.parametrize("cue_available", [False, True])
+def test_rejected_cuequivariance_selection_keeps_xpu_reference_usable(
+    monkeypatch, cue_available
+):
+    monkeypatch.setattr(_layers, "CUE_AVAILABLE", cue_available)
+    tri_mul = _layers.TriangleMultiplicativeUpdate(dim=4).to("xpu")
+    pair = torch.randn(1, 3, 3, 4, device="xpu")
+    previous_backend = tri_mul._engine._use_kernels
+
+    with pytest.raises(RuntimeError, match="cuequivariance.*CUDA-only"):
+        tri_mul.set_kernel_backend("cuequivariance")
+
+    assert tri_mul._engine._use_kernels is previous_backend
+    assert torch.isfinite(tri_mul(pair)).all()
+
+
 def test_cpu_lm_precision_context_does_not_autocast():
     with _model._lm_precision_context(fp8=False, device_type="cpu"):
         assert not torch.is_autocast_enabled("cpu")
