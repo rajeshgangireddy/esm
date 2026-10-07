@@ -2508,11 +2508,17 @@ class TriangleMultiplicativeUpdate(nn.Module):
     def set_kernel_backend(self, backend: str | None) -> None:
         # Engine uses cueq when backend=="cuequivariance"; the "fused" backend
         # routes through the parent PairUpdateBlock's fused path (bypassing this).
+        if backend == BACKEND_CUEQ:
+            device_type = self._engine.proj_bundle.weight.device.type
+            if device_type == "xpu":
+                raise RuntimeError(
+                    f"backend={BACKEND_CUEQ!r} is CUDA-only, got device {device_type!r}"
+                )
+            if not CUE_AVAILABLE:
+                raise RuntimeError(
+                    "backend='cuequivariance' but cuequivariance_torch is not installed."
+                )
         self._engine._use_kernels = backend == BACKEND_CUEQ
-        if backend == BACKEND_CUEQ and not CUE_AVAILABLE:
-            raise RuntimeError(
-                "backend='cuequivariance' but cuequivariance_torch is not installed."
-            )
 
     def set_chunk_size(self, chunk_size: int | None) -> None:
         self._engine.set_chunk_size(chunk_size)
