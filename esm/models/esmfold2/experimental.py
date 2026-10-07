@@ -1138,7 +1138,7 @@ class EsmFold2ExperimentalModel(HubPreTrainedModel):
             )
 
         # 7. Diffusion sampling (always no_grad; optional seed for parity)
-        with torch.no_grad(), _seed_context(seed):
+        with torch.no_grad(), _seed_context(seed, device_type=ref_pos.device.type):
             structure_output = self.structure_head.sample(
                 z_trunk=z.float(),
                 s_inputs=x_inputs,

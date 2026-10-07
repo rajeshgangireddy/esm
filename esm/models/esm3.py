@@ -227,7 +227,7 @@ class ESM3(nn.Module, ESM3InferenceClient):
 
     @classmethod
     def from_pretrained(
-        cls, model_name: str = ESM3_OPEN_SMALL, device: torch.device | None = None
+        cls, model_name: str = ESM3_OPEN_SMALL, device: torch.device | str | None = None
     ) -> ESM3:
         from esm.pretrained import load_local_model
 
@@ -236,6 +236,8 @@ class ESM3(nn.Module, ESM3InferenceClient):
             raise ValueError(f"Model name {model_name} is not a valid ESM3 model name.")
         if device is None:
             device = resolve_default_device()
+        else:
+            device = torch.device(device)
         model = load_local_model(model_name, device=device)
         if device.type != "cpu":
             model = model.to(torch.bfloat16)

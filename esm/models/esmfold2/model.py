@@ -529,7 +529,11 @@ def _lm_precision_context(fp8: bool, device_type: str):
     te.autocast keeps te.Linear outputs bf16 instead of the fp32 default
     (~425 MB at L=1024 in the hidden-state cache).
     """
-    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+    with torch.autocast(
+        device_type=device_type,
+        dtype=torch.bfloat16,
+        enabled=supports_amp_autocast(device_type),
+    ):
         if fp8 and TE_AVAILABLE:
             fp8_recipe = DelayedScaling(
                 fp8_format=Format.HYBRID,

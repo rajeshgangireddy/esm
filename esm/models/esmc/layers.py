@@ -37,7 +37,9 @@ def _get_xpu_rotary_kernel():
     """
     try:
         from esm.models.esmc.xpu_rotary import apply_rotary_emb_xpu
-    except ImportError:
+    except ModuleNotFoundError as exc:
+        if exc.name != "triton":
+            raise
         return None
     return apply_rotary_emb_xpu
 

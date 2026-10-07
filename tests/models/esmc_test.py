@@ -5,6 +5,7 @@ need published weights use ESMC-300M and skip when the Hub is unreachable. GPU
 tests are marked ``gpu``, XPU tests ``xpu``.
 """
 
+import builtins
 import functools
 import gzip
 import json
@@ -1429,6 +1430,29 @@ def test_xpu_rotary_falls_back_when_triton_is_missing(monkeypatch):
         expected_k = apply_rotary_emb_torch(k, rotary._cos_cached, rotary._sin_cached)
     torch.testing.assert_close(actual_q, expected_q, atol=1e-6, rtol=1e-6)
     torch.testing.assert_close(actual_k, expected_k, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize("missing_module", ["triton", "triton.language"])
+def test_xpu_rotary_import_only_ignores_missing_triton(monkeypatch, missing_module):
+    original_import = builtins.__import__
+
+    def failing_import(name, *args, **kwargs):
+        if name == "esm.models.esmc.xpu_rotary":
+            raise ModuleNotFoundError(
+                f"No module named {missing_module!r}", name=missing_module
+            )
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", failing_import)
+    layers_module._get_xpu_rotary_kernel.cache_clear()
+    try:
+        if missing_module == "triton":
+            assert layers_module._get_xpu_rotary_kernel() is None
+        else:
+            with pytest.raises(ModuleNotFoundError, match="triton.language"):
+                layers_module._get_xpu_rotary_kernel()
+    finally:
+        layers_module._get_xpu_rotary_kernel.cache_clear()
 
 
 # Every build reachable on a GPU: dtype x attention backend x fused/reference

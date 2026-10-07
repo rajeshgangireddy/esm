@@ -10,6 +10,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from esm import pretrained
 from esm.models.esm3 import ESM3, ESMOutput
 from esm.utils.constants import esm3 as C
 
@@ -33,6 +34,19 @@ def make_esm3() -> ESM3:
         function_decoder_fn=MagicMock(),
         tokenizers=tokenizers,
     )
+
+
+def test_from_pretrained_accepts_xpu_device_string(monkeypatch):
+    model = make_esm3()
+    loaded_devices: list[torch.device] = []
+
+    def load_local_model(model_name: str, device: torch.device) -> ESM3:
+        loaded_devices.append(device)
+        return model
+
+    monkeypatch.setattr(pretrained, "load_local_model", load_local_model)
+    assert ESM3.from_pretrained(device="xpu") is model
+    assert loaded_devices == [torch.device("xpu")]
 
 
 @pytest.mark.xpu

@@ -41,6 +41,8 @@ import torch
 
 from esm.models.esmfold2 import EsmFold2Config, EsmFold2ExperimentalModel, EsmFold2Model
 from esm.models.esmfold2 import layers as _layers
+from esm.models.esmfold2 import model as _model
+from esm.models.esmfold2 import processor as _processor
 from tests.conftest import ESMFOLD2_LENGTHS, ESMFOLD2_SEQUENCES, esmfold2_inputs
 
 #: Chunk sizes the matrix sweeps. ``None`` disables chunking entirely.
@@ -302,7 +304,8 @@ def test_set_kernel_backend_reaches_every_module(
     assert after == expected, f"appeared unconfigured: {sorted(after - expected)}"
 
 
-def test_cuequivariance_pair_bias_rejects_non_cuda_device(monkeypatch):
+@pytest.mark.parametrize("n_queries", [3, 751])
+def test_cuequivariance_pair_bias_rejects_non_cuda_device(monkeypatch, n_queries):
     """cuequivariance is CUDA-only; a host that merely *has* CUDA elsewhere
     (e.g. a CPU/XPU tensor on a CUDA+XPU machine) must not silently run the
     reference path or crash inside the cueq library - it should refuse
@@ -313,8 +316,8 @@ def test_cuequivariance_pair_bias_rejects_non_cuda_device(monkeypatch):
         d_model=8, d_pair=4, num_heads=2, use_conditioning=False
     )
     attn.set_kernel_backend("cuequivariance")
-    a = torch.randn(1, 751, 8)
-    z = torch.randn(1, 751, 751, 4)
+    a = torch.randn(1, n_queries, 8)
+    z = torch.randn(1, n_queries, n_queries, 4)
     with pytest.raises(RuntimeError, match="cuequivariance.*CUDA-only"):
         attn(a, None, z)
 
@@ -327,6 +330,73 @@ def test_cuequivariance_tri_mul_rejects_non_cuda_device(monkeypatch):
     pair = torch.randn(1, 3, 3, 4)
     with pytest.raises(RuntimeError, match="cuequivariance.*CUDA-only"):
         tri_mul(pair)
+
+
+def test_cpu_lm_precision_context_does_not_autocast():
+    with _model._lm_precision_context(fp8=False, device_type="cpu"):
+        assert not torch.is_autocast_enabled("cpu")
+
+
+@pytest.mark.parametrize("module", [_layers, _processor])
+def test_seed_context_restores_only_requested_accelerator(monkeypatch, module):
+    calls: list[tuple[str, str]] = []
+    state = [torch.tensor([42], dtype=torch.uint8)]
+    monkeypatch.setattr(
+        module, "get_rng_state_all", lambda kind: calls.append(("get", kind)) or state
+    )
+    monkeypatch.setattr(
+        module, "manual_seed_all", lambda kind, seed: calls.append(("seed", kind))
+    )
+    monkeypatch.setattr(
+        module, "set_rng_state_all", lambda kind, states: calls.append(("set", kind))
+    )
+    monkeypatch.setattr(
+        torch,
+        "manual_seed",
+        lambda seed: pytest.fail("torch.manual_seed seeds every accelerator"),
+    )
+    cpu_state = torch.get_rng_state()
+    with module._seed_context(123, device_type="xpu"):
+        torch.rand(1)
+    assert torch.equal(torch.get_rng_state(), cpu_state)
+    assert calls == [("get", "xpu"), ("seed", "xpu"), ("set", "xpu")]
+
+
+def test_input_builder_seeds_requested_device(monkeypatch):
+    builder = object.__new__(_processor.ESMFold2InputBuilder)
+    monkeypatch.setattr(_processor, "clean_esmfold2_input", lambda input: input)
+    monkeypatch.setattr(
+        _processor, "prepare_esmfold2_input", lambda input, seed: ({}, [])
+    )
+    requested: list[tuple[int, str]] = []
+
+    @contextlib.contextmanager
+    def record_seed_context(seed, *, device_type):
+        requested.append((seed, device_type))
+        yield
+
+    monkeypatch.setattr(_processor, "_seed_context", record_seed_context)
+    assert builder.prepare_input(input=None, seed=123, device="xpu") == ({}, [])
+    assert requested == [(123, "xpu")]
+
+
+@pytest.mark.xpu
+@pytest.mark.parametrize("module", [_layers, _processor])
+def test_seed_context_restores_xpu_rng(module):
+    before = torch.xpu.get_rng_state_all()
+    try:
+        with module._seed_context(123, device_type="xpu"):
+            first = torch.rand(3, device="xpu")
+        with module._seed_context(123, device_type="xpu"):
+            assert torch.equal(torch.rand(3, device="xpu"), first)
+        assert all(
+            torch.equal(saved, current)
+            for saved, current in zip(
+                before, torch.xpu.get_rng_state_all(), strict=True
+            )
+        )
+    finally:
+        torch.xpu.set_rng_state_all(before)
 
 
 #: Also found by this test: ``EsmFold2ExperimentalModel.set_chunk_size`` fans

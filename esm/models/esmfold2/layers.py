@@ -78,7 +78,6 @@ from esm.models.esmfold2.config import EsmFold2Config
 from esm.utils.device import (
     get_rng_state_all,
     manual_seed_all,
-    resolve_default_device,
     set_rng_state_all,
     supports_amp_autocast,
 )
@@ -1094,6 +1093,10 @@ class AttentionPairBias(nn.Module):
     def _can_use_cueq_pair_bias(
         self, z: Tensor, n_queries: int, beta: Tensor | float
     ) -> bool:
+        if self._kernel_backend == BACKEND_CUEQ and z.device.type != "cuda":
+            raise RuntimeError(
+                f"backend={BACKEND_CUEQ!r} is CUDA-only, got device {z.device.type!r}"
+            )
         if not (
             _cueq_active(self)
             and n_queries > 750
@@ -1102,13 +1105,6 @@ class AttentionPairBias(nn.Module):
             and hasattr(self, "pair_bias_proj")
         ):
             return False
-        if z.device.type != "cuda":
-            # cuequivariance is CUDA-only. Raise instead of silently falling
-            # back to the reference path -- the user explicitly asked for
-            # this backend.
-            raise RuntimeError(
-                f"backend={BACKEND_CUEQ!r} is CUDA-only, got device {z.device.type!r}"
-            )
         return True
 
     def forward(
@@ -2212,12 +2208,11 @@ class LanguageModelShim(nn.Module):
 
 
 @contextmanager
-def _seed_context(seed: int | None, *, seed_accelerator: bool = True):
+def _seed_context(seed: int | None, *, device_type: str, seed_accelerator: bool = True):
     """Temporarily seed Python, NumPy, and PyTorch RNGs."""
     if seed is None:
         yield
         return
-    device_type = resolve_default_device().type
     py_state = random.getstate()
     np_state = np.random.get_state()
     torch_state = torch.get_rng_state()
@@ -2225,7 +2220,7 @@ def _seed_context(seed: int | None, *, seed_accelerator: bool = True):
     seed = int(seed) % (2**32)
     random.seed(seed)
     np.random.seed(seed)
-    torch.manual_seed(seed)
+    torch.random.default_generator.manual_seed(seed)
     if seed_accelerator:
         manual_seed_all(device_type, seed)
     try:
