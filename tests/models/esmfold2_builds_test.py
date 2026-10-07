@@ -302,6 +302,33 @@ def test_set_kernel_backend_reaches_every_module(
     assert after == expected, f"appeared unconfigured: {sorted(after - expected)}"
 
 
+def test_cuequivariance_pair_bias_rejects_non_cuda_device(monkeypatch):
+    """cuequivariance is CUDA-only; a host that merely *has* CUDA elsewhere
+    (e.g. a CPU/XPU tensor on a CUDA+XPU machine) must not silently run the
+    reference path or crash inside the cueq library - it should refuse
+    clearly, because the user explicitly asked for this backend.
+    """
+    monkeypatch.setattr(_layers, "CUE_AVAILABLE", True)
+    attn = _layers.AttentionPairBias(
+        d_model=8, d_pair=4, num_heads=2, use_conditioning=False
+    )
+    attn.set_kernel_backend("cuequivariance")
+    a = torch.randn(1, 751, 8)
+    z = torch.randn(1, 751, 751, 4)
+    with pytest.raises(RuntimeError, match="cuequivariance.*CUDA-only"):
+        attn(a, None, z)
+
+
+def test_cuequivariance_tri_mul_rejects_non_cuda_device(monkeypatch):
+    """Same refusal for the triangle-multiplicative cueq path."""
+    monkeypatch.setattr(_layers, "CUE_AVAILABLE", True)
+    tri_mul = _layers.TriangleMultiplicativeUpdate(dim=4)
+    tri_mul.set_kernel_backend("cuequivariance")
+    pair = torch.randn(1, 3, 3, 4)
+    with pytest.raises(RuntimeError, match="cuequivariance.*CUDA-only"):
+        tri_mul(pair)
+
+
 #: Also found by this test: ``EsmFold2ExperimentalModel.set_chunk_size`` fans
 #: out to ``folding_trunk`` and ``confidence_head`` only, so an enabled
 #: ``msa_encoder`` keeps its construction-time chunk size. The release model
@@ -704,12 +731,7 @@ def test_every_gpu_build_reaches_the_cpu_reference(
 # XPU has no flash-attn and no cuequivariance build, so the matrix is just
 # backend x chunk size. Measured deltas were the same order as GPU_BUILDS
 # (9.4e-3 to 9.6e-3 vs 9.96e-3 to 1.01e-2), so it reuses GPU_TOLERANCE.
-XPU_BUILDS = [
-    (None, None),
-    (None, 64),
-    ("fused", None),
-    ("fused", 64),
-]
+XPU_BUILDS = [(None, None), (None, 64), ("fused", None), ("fused", 64)]
 
 
 @pytest.mark.xpu
@@ -755,4 +777,3 @@ def test_torch_compile_refuses_to_stack_with_the_fused_backend(tiny_esmfold2_con
     # to be enough to get past the guard.
     model.set_kernel_backend(None)
     model.apply_torch_compile(mode="fixed_seqlen")
-

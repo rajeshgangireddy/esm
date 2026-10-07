@@ -1413,6 +1413,24 @@ def test_xpu_rotary_keeps_reference_for_grad_or_non_fp32(
         assert torch.equal(actual_k, expected_k)
 
 
+@pytest.mark.xpu
+def test_xpu_rotary_falls_back_when_triton_is_missing(monkeypatch):
+    """Triton is an optional dependency (the ``fused`` extra). Without it,
+    fp32 XPU inference should use the reference path, not crash."""
+    monkeypatch.setattr(layers_module, "_get_xpu_rotary_kernel", lambda: None)
+    rotary = EsmcRotaryEmbedding(dim=16).to("xpu").eval()
+    q = torch.randn((2, 13, 3, 16), device="xpu", dtype=torch.float32)
+    k = torch.randn_like(q)
+
+    with torch.inference_mode():
+        actual_q, actual_k = rotary(q, k)
+        assert rotary._cos_cached is not None and rotary._sin_cached is not None
+        expected_q = apply_rotary_emb_torch(q, rotary._cos_cached, rotary._sin_cached)
+        expected_k = apply_rotary_emb_torch(k, rotary._cos_cached, rotary._sin_cached)
+    torch.testing.assert_close(actual_q, expected_q, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(actual_k, expected_k, atol=1e-6, rtol=1e-6)
+
+
 # Every build reachable on a GPU: dtype x attention backend x fused/reference
 # layers. flash_attention_2 is only paired with fp16 / bf16 because the kernel
 # rejects fp32, and only with the fused layers because a CPU-built model never

@@ -226,7 +226,9 @@ class ConfidenceHead(nn.Module):
         # each block's fused trimul engages. In-place residual avoids an
         # extra fp32 pair allocation.
         with torch.amp.autocast(
-            pair.device.type, enabled=supports_amp_autocast(pair.device.type), dtype=torch.bfloat16
+            pair.device.type,
+            enabled=supports_amp_autocast(pair.device.type),
+            dtype=torch.bfloat16,
         ):
             pair_delta = self.folding_trunk(pair, pair_attention_mask=pair_mask)
         pair.add_(pair_delta.float())

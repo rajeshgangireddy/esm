@@ -1094,13 +1094,22 @@ class AttentionPairBias(nn.Module):
     def _can_use_cueq_pair_bias(
         self, z: Tensor, n_queries: int, beta: Tensor | float
     ) -> bool:
-        return (
+        if not (
             _cueq_active(self)
             and n_queries > 750
             and z.dim() == 4
             and self._is_zero_beta(beta)
             and hasattr(self, "pair_bias_proj")
-        )
+        ):
+            return False
+        if z.device.type != "cuda":
+            # cuequivariance is CUDA-only. Raise instead of silently falling
+            # back to the reference path -- the user explicitly asked for
+            # this backend.
+            raise RuntimeError(
+                f"backend={BACKEND_CUEQ!r} is CUDA-only, got device {z.device.type!r}"
+            )
+        return True
 
     def forward(
         self,
@@ -2212,9 +2221,7 @@ def _seed_context(seed: int | None, *, seed_accelerator: bool = True):
     py_state = random.getstate()
     np_state = np.random.get_state()
     torch_state = torch.get_rng_state()
-    accel_states = (
-        get_rng_state_all(device_type) if seed_accelerator else None
-    )
+    accel_states = get_rng_state_all(device_type) if seed_accelerator else None
     seed = int(seed) % (2**32)
     random.seed(seed)
     np.random.seed(seed)
@@ -2437,6 +2444,14 @@ class TriangleMultiplicativeBlock(nn.Module):
             visibility = pair_grid.new_ones(pair_grid.shape[:-1])
 
         if self._use_kernels:
+            if pair_grid.device.type != "cuda":
+                # cuequivariance is CUDA-only. Raise here instead of letting
+                # the broad except below swallow a device mismatch as a
+                # "kernel failed" warning and silently fall back.
+                raise RuntimeError(
+                    f"backend={BACKEND_CUEQ!r} is CUDA-only, got device "
+                    f"{pair_grid.device.type!r}"
+                )
             p_in_weight, g_in_weight = self.split_kernel_weights()
 
             try:
@@ -2726,7 +2741,11 @@ class FoldingTrunk(nn.Module):
             len(self.blocks) > 0
             and getattr(self.blocks[0], "_kernel_backend", None) == BACKEND_FUSED
         )
-        if pair.device.type in _TRITON_DEVICE_TYPES and fused_on and orig_dtype != torch.bfloat16:
+        if (
+            pair.device.type in _TRITON_DEVICE_TYPES
+            and fused_on
+            and orig_dtype != torch.bfloat16
+        ):
             pair = pair.to(torch.bfloat16)
         for block in self.blocks:
             fn = partial(block, pair_attention_mask=pair_attention_mask)
