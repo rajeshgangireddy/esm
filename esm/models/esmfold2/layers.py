@@ -2216,7 +2216,9 @@ def _seed_context(seed: int | None, *, device_type: str, seed_accelerator: bool 
     py_state = random.getstate()
     np_state = np.random.get_state()
     torch_state = torch.get_rng_state()
-    accel_states = get_rng_state_all(device_type) if seed_accelerator else None
+    accelerator_states = (
+        get_rng_state_all(device_type) if seed_accelerator else None
+    )
     seed = int(seed) % (2**32)
     random.seed(seed)
     np.random.seed(seed)
@@ -2229,8 +2231,8 @@ def _seed_context(seed: int | None, *, device_type: str, seed_accelerator: bool 
         random.setstate(py_state)
         np.random.set_state(np_state)
         torch.set_rng_state(torch_state)
-        if accel_states is not None:
-            set_rng_state_all(device_type, accel_states)
+        if accelerator_states is not None:
+            set_rng_state_all(device_type, accelerator_states)
 
 
 # ===========================================================================

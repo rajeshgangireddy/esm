@@ -28,7 +28,7 @@ def _seed_context(seed: int | None, *, device_type: str):
     py_state = random.getstate()
     np_state = np.random.get_state()
     torch_state = torch.random.get_rng_state()
-    accel_state = get_rng_state_all(device_type)
+    accelerator_states = get_rng_state_all(device_type)
     random.seed(seed)
     np.random.seed(seed)
     torch.random.default_generator.manual_seed(seed)
@@ -39,8 +39,8 @@ def _seed_context(seed: int | None, *, device_type: str):
         random.setstate(py_state)
         np.random.set_state(np_state)
         torch.random.set_rng_state(torch_state)
-        if accel_state is not None:
-            set_rng_state_all(device_type, accel_state)
+        if accelerator_states is not None:
+            set_rng_state_all(device_type, accelerator_states)
 
 
 @contextmanager

@@ -1,10 +1,4 @@
-"""Device dispatch helpers, so cuda/xpu/cpu are handled the same way.
-
-Keep this separate from "is a CUDA-only library available" (flash-attn,
-xformers, transformer_engine, cuequivariance) -- that's a different question
-and stays gated on `torch.cuda.is_available()` directly, wherever it's
-checked.
-"""
+"""Device dispatch helpers for CUDA, XPU, and CPU."""
 
 from __future__ import annotations
 
@@ -23,19 +17,10 @@ def resolve_default_device() -> torch.device:
             # back to CPU on.
             raise RuntimeError(
                 "torch.accelerator.is_available() is True but "
-                "current_accelerator() returned None"
+                "current_accelerator() returned None."
             )
         return device
     return torch.device("cpu")
-
-
-def autocast_device_type(x: torch.Tensor | torch.device | torch.nn.Module) -> str:
-    """device_type string for torch.autocast, from a tensor/device/module."""
-    if isinstance(x, torch.device):
-        return x.type
-    if isinstance(x, torch.nn.Module):
-        return next(x.parameters()).device.type
-    return x.device.type
 
 
 def supports_amp_autocast(device_type: str) -> bool:
