@@ -5,8 +5,13 @@ from pathlib import Path
 
 
 def test_cuda_dependencies_are_optional() -> None:
-    project = tomllib.loads((Path(__file__).resolve().parents[1] / "pyproject.toml").read_text())["project"]
-    assert not any(requirement.startswith("cuequivariance") for requirement in project["dependencies"])
+    project = tomllib.loads(
+        (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
+    )["project"]
+    assert not any(
+        requirement.startswith("cuequivariance")
+        for requirement in project["dependencies"]
+    )
     extras = project["optional-dependencies"]
     for cuda in ("12", "13"):
         assert "cuequivariance-torch>=0.8.1" in extras[f"cueq{cuda}"]
