@@ -51,8 +51,6 @@ dependencies = [
   "pygtrie",
   "dna_features_viewer",
   "accelerate",
-  "cuequivariance-torch>=0.8.1; sys_platform == 'linux' and platform_machine == 'x86_64'",
-  "cuequivariance-ops-torch-cu13>=0.8.1; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
 [project.optional-dependencies]
@@ -62,8 +60,8 @@ fused = ["triton>=3,<4"]
 # ESMFold2 context-parallel ESM-C tensor parallelism (wrap_model_with_cp(tp_esmc=True)).
 fold-cp = ["transformer-engine[pytorch]>=2,<3"]
 # "cuequivariance" kernel backend — pick the build matching your CUDA toolkit.
-cueq12 = ["cuequivariance-torch", "cuequivariance-ops-torch-cu12"]
-cueq13 = ["cuequivariance-torch", "cuequivariance-ops-torch-cu13"]
+cueq12 = ["cuequivariance-torch>=0.8.1", "cuequivariance-ops-torch-cu12>=0.8.1"]
+cueq13 = ["cuequivariance-torch>=0.8.1", "cuequivariance-ops-torch-cu13>=0.8.1"]
 
 # Pytest
 [tool.pytest.ini_options]
