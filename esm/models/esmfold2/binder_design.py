@@ -675,13 +675,10 @@ def fold_and_get_distogram(
 
     inputs_list = []
     for seq in seq_list:
-        sequences = {
-            sequence: [str(idx)] for idx, sequence in enumerate(seq.split("|"))
-        }
         inputs_raw = StructurePredictionInput(
             sequences=[
-                ProteinInput(id=chain_id, sequence=sequence, msa=None)
-                for sequence, chain_id in sequences.items()
+                ProteinInput(id=str(idx), sequence=sequence, msa=None)
+                for idx, sequence in enumerate(seq.split("|"))
             ]
         )
         inputs_list.append(prepare_esmfold2_tensors(inputs_raw, max_atoms=max_atoms))
@@ -782,10 +779,10 @@ def to_atom_array(
     return biotite.structure.array(atoms)
 
 
-def build_complex(
+def build_atom_array(
     inputs: dict[str, torch.Tensor], output: dict[str, Any]
-) -> ProteinComplex:
-    """Build ProteinComplex from model output."""
+) -> biotite.structure.AtomArray:
+    """Build the all-atom AtomArray from model output."""
     plddt_per_atom = output.get("plddt_per_atom")
     if plddt_per_atom is not None:
         plddt_per_atom = plddt_per_atom[0].cpu().numpy() * PLDDT_B_FACTOR_SCALE
@@ -801,6 +798,13 @@ def build_complex(
         atom_attention_mask=inputs["atom_attention_mask"][0].cpu().numpy(),
         plddt_per_atom=plddt_per_atom,
     )
+
+
+def build_complex(
+    inputs: dict[str, torch.Tensor], output: dict[str, Any]
+) -> ProteinComplex:
+    """Build ProteinComplex from model output."""
+    atom_arr = build_atom_array(inputs, output)
     return ProteinComplex.from_chains(
         [
             ProteinChain.from_atomarray(a, is_predicted=True)
@@ -910,8 +914,9 @@ def compute_esmc_pseudoperplexity_nll(
     masked_sequence_rows = torch.cat(all_masked_sequences, dim=0)
     for start in range(0, masked_sequence_rows.size(0), batch_size):
         chunk = masked_sequence_rows[start : start + batch_size]
+        use_amp = device.type in ("cuda", "xpu")
         with torch.autocast(
-            device_type="cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"
+            device_type=device.type, dtype=torch.bfloat16, enabled=use_amp
         ):
             hidden, *_ = esmc.transformer(
                 chunk @ esmc.embed.weight.to(chunk.dtype),
@@ -919,6 +924,8 @@ def compute_esmc_pseudoperplexity_nll(
                 layers_to_collect=[],
                 output_attentions=False,
             )
+            if not use_amp:
+                hidden = hidden.to(esmc_model.lm_head.weight.dtype)
             logit_chunks.append(esmc_model.lm_head(hidden))
     logits = torch.cat(logit_chunks, dim=0)
 
@@ -967,6 +974,7 @@ def design_binder(
     target_hotspot_ids: list[str] | None = None,
     epitope_contact_distance: float = 12.0,
     device: torch.device | str = "cpu",
+    num_steps: int = STEPS,
 ) -> tuple[list[str], Trajectory, list[dict]]:
     """
     Algorithm 11 Gradient-Guided Binder Sequence Optimization.
@@ -1122,9 +1130,9 @@ def design_binder(
     optimizer = optim.SGD([logits], lr=LEARNING_RATE)
     best_iptm: list[float] = [-1.0] * batch_size
     best_sequences: list[str] = [""] * batch_size
-    for step in range(STEPS):
+    for step in range(num_steps):
         # Cosine schedule
-        t = (step + 1) / STEPS
+        t = (step + 1) / num_steps
         remaining = 0.5 * (1 + math.cos(math.pi * t))
         temperature = TEMPERATURE_MIN + (1 - TEMPERATURE_MIN) * remaining
         logits, sequences, iptm = run_step(
@@ -1165,11 +1173,23 @@ def design_binder(
             calculate_confidence=not is_scaling_critic,
             seed=seed,
         )
-        pred_complex = (
-            None
-            if is_scaling_critic
-            else build_complex(final_fold["inputs"], final_fold["output"])
-        )
+        pred_complex = None
+        native: dict = {}
+        if not is_scaling_critic:
+            inputs, output = final_fold["inputs"], final_fold["output"]
+            pred_complex = build_complex(inputs, output)
+            valid = inputs["atom_attention_mask"][0].bool()
+            native = {
+                "atom_array": build_atom_array(inputs, output),
+                "ptm": output["ptm"][0].item(),
+                "plddt": output["plddt"][0].float().cpu().numpy(),
+                "plddt_per_atom": output["plddt_per_atom"][0][valid]
+                .float()
+                .cpu()
+                .numpy(),
+                "pae": output["pae"][0].float().cpu().numpy(),
+                "atom_to_token": inputs["atom_to_token"][0][valid].cpu().numpy(),
+            }
         iptm_proxy_scores = compute_distogram_iptm_proxy(
             final_fold["distogram_logits"], target_length, binder_seq, is_antibody
         )
@@ -1183,6 +1203,7 @@ def design_binder(
                 "batch_idx": batch_idx,
                 "designed_sequence": best_seq,
                 "complex": pred_complex,
+                **native,
                 "final_loss": final_total_loss[batch_idx].item(),
                 "iptm": iptm,
                 "logits": logits[batch_idx].detach().cpu(),
@@ -1312,6 +1333,7 @@ class ESMFold2Design:
         batch_size: int = 1,
         target_hotspot_ids: list[str] | None = None,
         epitope_contact_distance: float = 12.0,
+        num_steps: int = STEPS,
     ) -> tuple[list[str], Trajectory, list[dict]]:
         return design_binder(
             self.inversion_models,
@@ -1328,4 +1350,5 @@ class ESMFold2Design:
             target_hotspot_ids=target_hotspot_ids,
             epitope_contact_distance=epitope_contact_distance,
             device=self.device,
+            num_steps=num_steps,
         )
