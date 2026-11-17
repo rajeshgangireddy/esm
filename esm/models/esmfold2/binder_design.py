@@ -581,14 +581,18 @@ def compute_distogram_iptm_proxy(
     if not is_antibody:
         cdr_distogram_iptm_proxy = float("nan")
     else:
-        cdr_indices = _cdr_indices(binder_sequence)
-        cdr_rows = [binder_start + i for i in cdr_indices]
-        cdr_to_target_entropy = _binding_confidence_entropy(
-            distogram_logits[cdr_rows, :target_length, :], bin_distance, cutoff=22.0
-        )
-        cdr_distogram_iptm_proxy = _entropy_to_confidence(
-            _mean_lowest_k(cdr_to_target_entropy, k=len(cdr_indices))
-        )
+        try:
+            cdr_indices = _cdr_indices(binder_sequence)
+        except (ImportError, FileNotFoundError):
+            cdr_distogram_iptm_proxy = float("nan")
+        else:
+            cdr_rows = [binder_start + i for i in cdr_indices]
+            cdr_to_target_entropy = _binding_confidence_entropy(
+                distogram_logits[cdr_rows, :target_length, :], bin_distance, cutoff=22.0
+            )
+            cdr_distogram_iptm_proxy = _entropy_to_confidence(
+                _mean_lowest_k(cdr_to_target_entropy, k=len(cdr_indices))
+            )
 
     return {
         "distogram_iptm_proxy": distogram_iptm_proxy,
@@ -802,10 +806,13 @@ def build_atom_array(
 
 
 def build_complex(
-    inputs: dict[str, torch.Tensor], output: dict[str, Any]
+    inputs: dict[str, torch.Tensor],
+    output: dict[str, Any],
+    atom_arr: biotite.structure.AtomArray | None = None,
 ) -> ProteinComplex:
     """Build ProteinComplex from model output."""
-    atom_arr = build_atom_array(inputs, output)
+    if atom_arr is None:
+        atom_arr = build_atom_array(inputs, output)
     return ProteinComplex.from_chains(
         [
             ProteinChain.from_atomarray(a, is_predicted=True)
@@ -1178,10 +1185,11 @@ def design_binder(
         native: dict = {}
         if not is_scaling_critic:
             inputs, output = final_fold["inputs"], final_fold["output"]
-            pred_complex = build_complex(inputs, output)
+            atom_arr = build_atom_array(inputs, output)
+            pred_complex = build_complex(inputs, output, atom_arr=atom_arr)
             valid = inputs["atom_attention_mask"][0].bool()
             native = {
-                "atom_array": build_atom_array(inputs, output),
+                "atom_array": atom_arr,
                 "ptm": output["ptm"][0].item(),
                 "plddt": output["plddt"][0].float().cpu().numpy(),
                 "plddt_per_atom": output["plddt_per_atom"][0][valid]
