@@ -796,6 +796,7 @@ def build_atom_array(
         atom_attention_mask=inputs["atom_attention_mask"][0].cpu().numpy(),
         plddt_per_atom=plddt_per_atom,
     )
+    return atom_arr
 
 
 def build_complex(
