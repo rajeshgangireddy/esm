@@ -8,18 +8,11 @@ _ACCELERATED_AUTOCAST_TYPES = ("cuda", "xpu")
 
 
 def resolve_default_device() -> torch.device:
-    """Best available accelerator, else CPU."""
-    if torch.accelerator.is_available():
-        device = torch.accelerator.current_accelerator()
-        if device is None:
-            # is_available() said yes, current_accelerator() said no -- that's
-            # a torch bug or a broken install, not a case to silently fall
-            # back to CPU on.
-            raise RuntimeError(
-                "torch.accelerator.is_available() is True but "
-                "current_accelerator() returned None."
-            )
-        return device
+    """Prefer CUDA, then XPU, otherwise CPU."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.xpu.is_available():
+        return torch.device("xpu")
     return torch.device("cpu")
 
 

@@ -801,6 +801,22 @@ def test_honours_attn_implementation_from_config(tmp_path, tiny_esmc_config):
     assert explicit.config.attn_implementation == "sdpa"
 
 
+def test_from_pretrained_defaults_to_cpu_on_mps(
+    monkeypatch, tmp_path, tiny_esmc_config
+):
+    EsmcForMaskedLM(tiny_esmc_config).save_pretrained(tmp_path)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.xpu, "is_available", lambda: False)
+    monkeypatch.setattr(torch.accelerator, "is_available", lambda: True)
+    monkeypatch.setattr(
+        torch.accelerator, "current_accelerator", lambda: torch.device("mps")
+    )
+
+    model = EsmcForMaskedLM.from_pretrained(tmp_path)
+
+    assert next(model.parameters()).device.type == "cpu"
+
+
 def test_published_layout_round_trip_is_bit_identical(tiny_esmc_config):
     """Fusing on load and splitting on save must compose to the identity.
 

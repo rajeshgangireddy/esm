@@ -199,9 +199,8 @@ class EsmcPreTrainedModel(HubPreTrainedModel):
     ) -> Self:
         """Load an ESMC model from a local directory or the HuggingFace Hub.
 
-        ``device`` defaults to CUDA when one is present, and selects the fused
-        kernels as well as the placement: they are CUDA-only, so a model built
-        for the CPU must not use them. Additional keywords override downloaded
+        ``device`` defaults to CUDA, then XPU, then CPU, and determines which
+        fused kernels can be used. Additional keywords override downloaded
         config fields; unknown fields raise ``TypeError``.
         """
         local_dir = resolve_model_dir(
