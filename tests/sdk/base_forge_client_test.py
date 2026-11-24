@@ -1,33 +1,48 @@
-"""The batch client's polling backoff and per-endpoint wait defaults."""
+"""The batch client: polling backoff, per-endpoint wait defaults, and request headers."""
 
 import itertools
 
+import httpx
 import pytest
+from attr import define
 
 from esm.sdk import base_forge_client
 from esm.sdk.api import ESMProteinError
 from esm.sdk.base_forge_client import (
     DEFAULT_POLL_INTERVAL,
     EndpointHandler,
+    _BaseForgeInferenceClient,
     _poll_intervals,
+    _sdk_version,
 )
+from esm.sdk.batch import BatchSubmission
 from esm.sdk.forge import ForgeBatchClient
+from esm.utils.structure.input_builder import ProteinInput, StructurePredictionInput
 
 
-class _QuietHandler(EndpointHandler[dict]):
+@define
+class _QuietRequest:
+    pass
+
+
+class _QuietHandler(EndpointHandler[_QuietRequest, dict]):
     """An endpoint that states no pacing of its own, so the layers above it decide."""
+
+    request_type = _QuietRequest
 
     @property
     def endpoint_name(self) -> str:
         return "quiet"
 
-    def _prepare_request(self, **kwargs) -> list[dict]:
-        return []
+    def _prepare_request(
+        self, request: _QuietRequest, *, model_name: str | None = None
+    ) -> dict:
+        return {}
 
-    def _process_response(self, response: dict, **kwargs) -> dict:
+    def _process_response(self, response: dict) -> dict:
         return response
 
-    async def _async_process_response(self, response: dict, **kwargs) -> dict:
+    async def _async_process_response(self, response: dict) -> dict:
         return response
 
 
@@ -182,8 +197,9 @@ def test_a_failed_job_raises_with_the_server_reason(clock):
 def _stub_submission(
     monkeypatch: pytest.MonkeyPatch, handler: EndpointHandler, task_id: str
 ) -> None:
-    monkeypatch.setattr(handler, "_prepare_request", lambda **kwargs: [])
-    monkeypatch.setattr(handler._batch_client, "submit", lambda *a, **kw: task_id)
+    monkeypatch.setattr(handler, "_prepare_request", lambda request, **kwargs: {})
+    submission = BatchSubmission(endpoint=handler.endpoint_name, task_ids=(task_id,))
+    monkeypatch.setattr(handler._batch_client, "submit", lambda *a, **kw: submission)
 
 
 def test_the_users_interval_reaches_the_wait_loop(clock, monkeypatch):
@@ -192,7 +208,13 @@ def test_the_users_interval_reaches_the_wait_loop(clock, monkeypatch):
     handler = client.fold_max_accuracy
     _stub_submission(monkeypatch, handler, "task-7")
 
-    result = handler.run(timeout=90, cancel_on_timeout=False)
+    result = handler.run(
+        all_atom_input=StructurePredictionInput(
+            sequences=[ProteinInput(id="A", sequence="ACDEF")]
+        ),
+        timeout=90,
+        cancel_on_timeout=False,
+    )
 
     assert isinstance(result, ESMProteinError)
     assert clock.sleeps == [45, 45]
@@ -204,7 +226,84 @@ def test_a_per_call_interval_reaches_the_wait_loop(clock, monkeypatch):
     handler = client.fold_max_accuracy
     _stub_submission(monkeypatch, handler, "task-8")
 
-    result = handler.run(timeout=60, cancel_on_timeout=False, poll_interval=20)
+    result = handler.run(
+        all_atom_input=StructurePredictionInput(
+            sequences=[ProteinInput(id="A", sequence="ACDEF")]
+        ),
+        timeout=60,
+        cancel_on_timeout=False,
+        poll_interval=20,
+    )
 
     assert isinstance(result, ESMProteinError)
     assert clock.sleeps == [20, 20, 20]
+
+
+BIOHUB_COMPONENT = f"biohub/forge-sdk-python/{_sdk_version()}"
+
+
+def _client() -> _BaseForgeInferenceClient:
+    return _BaseForgeInferenceClient(
+        model="esmc-300m-2024-12",
+        url="https://biohub.ai",
+        token="test-token",
+        request_timeout=1,
+        min_retry_wait=1,
+        max_retry_wait=1,
+        max_retry_attempts=1,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("user_agent", [None, "custom-transport/1.0"])
+async def test_posts_component_and_preserves_transport_user_agent(
+    asynchronous: bool, user_agent: str | None
+) -> None:
+    client = _client()
+    requests: list[httpx.Request] = []
+
+    def handle_request(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"outputs": {}})
+
+    transport = httpx.MockTransport(handle_request)
+    transport_headers = {} if user_agent is None else {"User-Agent": user_agent}
+    override = {"x-biohub-component": f"biohub/forge-sdk-python-test/{_sdk_version()}"}
+    request_headers = [{}, override, {}]
+
+    if asynchronous:
+        async with httpx.AsyncClient(
+            transport=transport, headers=transport_headers
+        ) as http_client:
+            client._async_client = http_client
+            for headers in request_headers:
+                assert await client._async_post("fold", {}, headers=headers) == {
+                    "outputs": {}
+                }
+    else:
+        with httpx.Client(
+            transport=transport, headers=transport_headers
+        ) as http_client:
+            client._client = http_client
+            for headers in request_headers:
+                assert client._post("fold", {}, headers=headers) == {"outputs": {}}
+
+    assert [request.headers.get_list("x-biohub-component") for request in requests] == [
+        [BIOHUB_COMPONENT],
+        [override["x-biohub-component"]],
+        [BIOHUB_COMPONENT],
+    ]
+    for request in requests:
+        assert request.headers["authorization"] == "Bearer test-token"
+        assert request.headers.get_list("user-agent") == [
+            user_agent or f"python-httpx/{httpx.__version__}"
+        ]
+
+    assert client.headers == {
+        "Authorization": "Bearer test-token",
+        "X-Biohub-Component": BIOHUB_COMPONENT,
+    }
+    assert override == {
+        "x-biohub-component": f"biohub/forge-sdk-python-test/{_sdk_version()}"
+    }

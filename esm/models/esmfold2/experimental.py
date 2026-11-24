@@ -1,17 +1,3 @@
-# coding=utf-8
-# Copyright 2026 Biohub. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 """ESMFold2 experimental variant — older architecture from during the
 development of ESMFold2.
 
@@ -429,6 +415,9 @@ class MSAEncoderBlock(nn.Module):
         pair_repr = pair_repr + _maybe_mask(
             self.outer_product_mean(msa_repr, msa_attention_mask)
         )
+        # Eager on purpose, including under "fast": _maybe_mask scales the
+        # update before the residual add, and the fused kernel adds its residual
+        # inside. model.py's MSAEncoderBlock has no such mask and does fuse.
         pair_repr = pair_repr + _maybe_mask(
             self.tri_mul_out(pair_repr, mask=pair_attention_mask)
         )
@@ -622,8 +611,16 @@ class EsmFold2ExperimentalModel(HubPreTrainedModel):
         self.post_init()
 
     def set_kernel_backend(self, backend: str | None) -> None:
-        """Select kernel backend (None / "fused" / "cuequivariance")."""
+        """Select kernel backend (None / "fused" / "fast").
+
+        "fast" does not reach this model's MSA encoder: its block scales each
+        triangle update by the MSA track mask before the residual, which the
+        kernel's fused residual cannot express. ``ESMFOLD2_BF16_DIT_GEMM=1``,
+        set before import, selects bf16 GEMM operands in the diffusion as it
+        does for ``EsmFold2Model.set_kernel_backend``.
+        """
         self.folding_trunk.set_kernel_backend(backend)
+        self.inputs_embedder.set_kernel_backend(backend)
         if self.confidence_head is not None:
             self.confidence_head.set_kernel_backend(backend)
         self.structure_head.set_kernel_backend(backend)

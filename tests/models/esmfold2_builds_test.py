@@ -268,9 +268,9 @@ KERNEL_BACKEND_VARIANTS = ["release", "release_msa", "experimental", "experiment
 
 
 @pytest.mark.parametrize("variant", KERNEL_BACKEND_VARIANTS)
-@pytest.mark.parametrize("backend", [None, "fused", "cuequivariance"])
+@pytest.mark.parametrize("backend", [None, "fused"])
 def test_set_kernel_backend_reaches_every_module(
-    tiny_esmfold2_config, monkeypatch, variant, backend
+    tiny_esmfold2_config, variant, backend
 ):
     """Every module that *can* take a backend must be *given* one.
 
@@ -281,13 +281,7 @@ def test_set_kernel_backend_reaches_every_module(
     the reference path, and every output comparison still passes because the
     reference path is correct, merely slow. That is exactly the defect behind
     ``fix(esm): no-op set_kernel_backend on the CP diffusion wrapper``.
-
-    ``CUE_AVAILABLE`` is forced on because ``TriangleMultiplicativeUpdate``
-    refuses ``cuequivariance`` outright when the package is missing, which would
-    reduce this case to a skip on every CPU runner. Nothing here executes a
-    kernel, so the flag only unblocks the traversal.
     """
-    monkeypatch.setattr(_layers, "CUE_AVAILABLE", True)
     model = model_variant(variant, tiny_esmfold2_config).eval()
     calls, expected = instrument_fanout(model, "set_kernel_backend")
 
@@ -304,54 +298,26 @@ def test_set_kernel_backend_reaches_every_module(
     assert after == expected, f"appeared unconfigured: {sorted(after - expected)}"
 
 
-@pytest.mark.parametrize("n_queries", [3, 751])
-def test_cuequivariance_pair_bias_rejects_non_cuda_device(monkeypatch, n_queries):
-    """cuequivariance is CUDA-only; a host that merely *has* CUDA elsewhere
-    (e.g. a CPU/XPU tensor on a CUDA+XPU machine) must not silently run the
-    reference path or crash inside the cueq library - it should refuse
-    clearly, because the user explicitly asked for this backend.
-    """
-    monkeypatch.setattr(_layers, "CUE_AVAILABLE", True)
-    attn = _layers.AttentionPairBias(
-        d_model=8, d_pair=4, num_heads=2, use_conditioning=False
-    )
-    attn.set_kernel_backend("cuequivariance")
-    a = torch.randn(1, n_queries, 8)
-    z = torch.randn(1, n_queries, n_queries, 4)
-    with pytest.raises(RuntimeError, match="cuequivariance.*CUDA-only"):
-        attn(a, None, z)
+@pytest.mark.parametrize("device", ["cpu", pytest.param("xpu", marks=pytest.mark.xpu)])
+def test_parked_lm_restores_device_and_autocast(tiny_esmfold2, monkeypatch, device):
+    model = tiny_esmfold2.to(device)
+    model.esmc = torch.nn.Linear(1, 1, device=device)
+    model._offload_esmc = True
+    cleared = []
+    monkeypatch.setattr(_model, "empty_cache", cleared.append)
+    model._park_esmc_after_lm(12)
+    assert model._esmc_parked and model.esmc.weight.device.type == "cpu"
+    assert cleared == [device]
+    seen = []
 
+    def hidden_states(*args, **kwargs):
+        assert model.esmc.weight.device.type == device
+        seen.append(torch.is_autocast_enabled(device))
 
-def test_cuequivariance_tri_mul_rejects_non_cuda_device(monkeypatch):
-    """Same refusal for the triangle-multiplicative cueq path."""
-    monkeypatch.setattr(_layers, "CUE_AVAILABLE", True)
-    tri_mul = _layers.TriangleMultiplicativeUpdate(dim=4)
-    tri_mul.set_kernel_backend("cuequivariance")
-    pair = torch.randn(1, 3, 3, 4)
-    with pytest.raises(RuntimeError, match="cuequivariance.*CUDA-only"):
-        tri_mul(pair)
-
-
-@pytest.mark.xpu
-@pytest.mark.parametrize("cue_available", [False, True])
-def test_rejected_cuequivariance_selection_keeps_xpu_reference_usable(
-    monkeypatch, cue_available
-):
-    monkeypatch.setattr(_layers, "CUE_AVAILABLE", cue_available)
-    tri_mul = _layers.TriangleMultiplicativeUpdate(dim=4).to("xpu")
-    pair = torch.randn(1, 3, 3, 4, device="xpu")
-    previous_backend = tri_mul._engine._use_kernels
-
-    with pytest.raises(RuntimeError, match="cuequivariance.*CUDA-only"):
-        tri_mul.set_kernel_backend("cuequivariance")
-
-    assert tri_mul._engine._use_kernels is previous_backend
-    assert torch.isfinite(tri_mul(pair)).all()
-
-
-def test_cpu_lm_precision_context_does_not_autocast():
-    with _model._lm_precision_context(fp8=False, device_type="cpu"):
-        assert not torch.is_autocast_enabled("cpu")
+    monkeypatch.setattr(_model, "compute_lm_hidden_states", hidden_states)
+    model._compute_lm_hidden_states(None, None, None, None, None)
+    assert seen == [device != "cpu"]
+    assert not model._esmc_parked
 
 
 @pytest.mark.parametrize("module", [_layers, _processor])
@@ -598,9 +564,10 @@ def cpu_fp32_result(kernel_esmfold2_config):
 # fp32, and that dominates.
 #
 # Observed at L=197, first the floor (two eager CUDA runs, so only CUDA's own
-# reduction-order nondeterminism separates them), then the worst case across all
-# seven GPU_BUILDS:
-#                       gpu-vs-gpu floor   cpu-vs-gpu, all seven builds
+# reduction-order nondeterminism separates them), then the worst case across
+# every GPU_BUILDS row. Measured while the matrix still carried two
+# cuequivariance rows, so these are upper bounds for the five that remain:
+#                       gpu-vs-gpu floor   cpu-vs-gpu, all builds
 #   sample_atom_coords  1.19e-03 A         9.96e-03 to 1.014e-02 A
 #   distogram_logits    2.72e-02           2.44
 #   pae                 2.41e-02           2.28 to 2.30
@@ -636,8 +603,6 @@ GPU_BUILDS = [
     (None, True, None),
     ("fused", False, None),
     ("fused", True, 64),
-    ("cuequivariance", False, None),
-    ("cuequivariance", True, 64),
 ]
 
 
@@ -664,16 +629,8 @@ def assert_backend_dispatched(model, backend):
 
     if backend == "fused":
         assert _layers.TRITON_KERNELS_AVAILABLE
-        for module in transitions:
-            assert module._fused_swiglu is not None
         for block in pair_blocks:
             assert block.row_drop._use_fused_kernels
-    else:
-        for module in transitions:
-            assert module._fused_swiglu is None
-
-    for tri_mul in tri_muls:
-        assert tri_mul._engine._use_kernels == (backend == "cuequivariance")
 
 
 def assert_chunking_dispatched(model, chunk_size):
@@ -707,8 +664,6 @@ def skip_if_flash_missing(flash: bool):
 def skip_if_backend_missing(backend):
     if backend == "fused" and not _layers.TRITON_KERNELS_AVAILABLE:
         pytest.skip("triton kernels unavailable")  # ty:ignore[too-many-positional-arguments]
-    if backend == "cuequivariance" and not _layers.CUE_AVAILABLE:
-        pytest.skip("cuequivariance unavailable")  # ty:ignore[too-many-positional-arguments]
 
 
 @pytest.mark.gpu
@@ -815,9 +770,7 @@ def test_every_gpu_build_reaches_the_cpu_reference(
     assert_close_to_reference(result, cpu_fp32_result, GPU_TOLERANCE, label)
 
 
-# XPU has no flash-attn and no cuequivariance build, so the matrix is just
-# backend x chunk size. Measured deltas were the same order as GPU_BUILDS
-# (9.4e-3 to 9.6e-3 vs 9.96e-3 to 1.01e-2), so it reuses GPU_TOLERANCE.
+# XPU covers the reference and portable fused paths, with and without chunking.
 XPU_BUILDS = [(None, None), (None, 64), ("fused", None), ("fused", 64)]
 
 

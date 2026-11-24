@@ -24,7 +24,7 @@ def resolve_default_device() -> torch.device:
 
 
 def supports_amp_autocast(device_type: str) -> bool:
-    """Whether device_type supports bf16/fp16 autocast (cuda, xpu do; mps/cpu don't the same way)."""
+    """Use CUDA/XPU autocast while preserving CPU/MPS precision."""
     return device_type in _ACCELERATED_AUTOCAST_TYPES
 
 
@@ -33,13 +33,6 @@ def empty_cache(device_type: str) -> None:
         torch.cuda.empty_cache()
     elif device_type == "xpu":
         torch.xpu.empty_cache()
-
-
-def synchronize(device_type: str) -> None:
-    if device_type == "cuda":
-        torch.cuda.synchronize()
-    elif device_type == "xpu":
-        torch.xpu.synchronize()
 
 
 def manual_seed_all(device_type: str, seed: int) -> None:
